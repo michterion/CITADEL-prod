@@ -145,7 +145,7 @@ def get_db_pool():
         st.error("⚠️ Brak konfiguracji bazy danych w secrets.toml lub zmiennej DATABASE_URL.")
         st.stop()
         
-    return ConnectionPool(conninfo=conninfo, min_size=1, max_size=10, open=True)
+    return ConnectionPool(conninfo=conninfo, min_size=1, max_size=5, open=True)
 
 pool = get_db_pool()
 
@@ -309,20 +309,9 @@ def generuj_zrzut_bazy_sql():
     filename = f"citadel_backup_{timestamp_str}.sql"
     filepath = os.path.join("backups", filename)
     
-    # 1. Kolejność FK-safe: rodzice najpierw, dzieci później
     tabele_parent_to_child = [
-        "kraje", 
-        "regiony", 
-        "kola", 
-        "uzytkownicy",        # <--- EKSPORT KONT I RÓL
-        "czlonkowie", 
-        "wplaty", 
-        "wplaty_oczekujace",  # <--- EKSPORT BUFORA
-        "naliczenia_reczne", 
-        "korekty", 
-        "wydatki", 
-        "korekty_kasy", 
-        "audit_log"
+        "kraje", "regiony", "kola", "uzytkownicy", "czlonkowie", 
+        "wplaty", "wplaty_oczekujace", "naliczenia_reczne", "korekty", "wydatki", "korekty_kasy", "audit_log"
     ]
     tabele_child_to_parent = tabele_parent_to_child[::-1]
 
@@ -341,11 +330,10 @@ def generuj_zrzut_bazy_sql():
         f_out.write("SET session_replication_role = replica; -- Wyłącza sprawdzanie FK i triggery na czas odtwarzania\n\n")
         f_out.write("BEGIN;\n\n")
         f_out.write(DDL_SCHEMA_EXPORT)
-        f_out.write("\n-- === CZYSZCZENIE DANYCH PRZED IMPORTEM (KOLEJNOŚĆ DZIECI -> RODZICE) ===\n")
+        f_out.write("\n-- === CZYSZCZENIE DANYCH PRZED IMPORTEM ===\n")
         
         truncate_list = ", ".join([f'"{t}"' for t in tabele_child_to_parent])
         f_out.write(f"TRUNCATE TABLE {truncate_list} CASCADE;\n\n")
-        f_out.write("-- === WSTAWIANIE DANYCH (KOLEJNOŚĆ RODZICE -> DZIECI) ===\n")
 
         with pool.connection() as conn:
             with conn.cursor() as cur:
@@ -377,7 +365,7 @@ def generuj_zrzut_bazy_sql():
                         f_out.write(f'SELECT setval(pg_get_serial_sequence(\'"{tab}"\', \'id\'), COALESCE(max(id), 1)) FROM "{tab}";\n')
 
         f_out.write("\nCOMMIT;\n\n")
-        f_out.write("SET session_replication_role = DEFAULT; -- Przywraca normalne działanie triggerów i sprawdzania kluczy obcych\n")
+        f_out.write("SET session_replication_role = DEFAULT; -- Przywraca normalne działanie triggerów i FK\n")
 
     file_size_kb = os.path.getsize(filepath) / 1024.0
     return filepath, filename, file_size_kb, "Citadel Python Engine (FK-safe + RBAC)"
@@ -649,8 +637,9 @@ DARK_THEME_CSS = """
 """
 st.markdown(DARK_THEME_CSS, unsafe_allow_html=True)
 
-# --- INICJALIZACJA STRUKTURY, CHECK CONSTRAINTS, MIGRACJI I INDEKSÓW ---
-def init_db():
+# --- INICJALIZACJA STRUKTURY (ZOPTYMALIZOWANA: ODPALA SIĘ DOKŁADNIE RAZ DZIĘKI @st.cache_resource) ---
+@st.cache_resource(show_spinner=False)
+def init_db_once():
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -670,9 +659,6 @@ def init_db():
                     deleted_at TIMESTAMPTZ
                 );
             """)
-            cur.execute("ALTER TABLE regiony ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;")
-            cur.execute("ALTER TABLE regiony ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;")
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS kola (
                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -684,13 +670,6 @@ def init_db():
                     deleted_by_region_id BIGINT REFERENCES regiony(id) ON DELETE SET NULL
                 );
             """)
-            cur.execute("ALTER TABLE kola ADD COLUMN IF NOT EXISTS kraj_id BIGINT REFERENCES kraje(id) ON DELETE RESTRICT DEFAULT 1;")
-            cur.execute("ALTER TABLE kola ADD COLUMN IF NOT EXISTS region_id BIGINT REFERENCES regiony(id) ON DELETE SET NULL;")
-            cur.execute("ALTER TABLE kola ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;")
-            cur.execute("ALTER TABLE kola ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;")
-            cur.execute("ALTER TABLE kola ADD COLUMN IF NOT EXISTS deleted_by_region_id BIGINT REFERENCES regiony(id) ON DELETE SET NULL;")
-
-            # UŻYTKOWNICY I ROLE RBAC
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS uzytkownicy (
                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -709,15 +688,6 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_uzytkownicy_login ON uzytkownicy(login);
             """)
-
-            cur.execute("""
-                DO $$
-                BEGIN
-                    ALTER TABLE kola DROP CONSTRAINT IF EXISTS kola_nazwa_key;
-                    ALTER TABLE regiony DROP CONSTRAINT IF EXISTS regiony_nazwa_key;
-                EXCEPTION WHEN OTHERS THEN NULL;
-                END $$;
-            """)
             cur.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_aktywne_kola_nazwa 
                 ON kola (nazwa) WHERE (is_deleted = FALSE);
@@ -726,7 +696,6 @@ def init_db():
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_aktywne_regiony_nazwa 
                 ON regiony (kraj_id, nazwa) WHERE (is_deleted = FALSE);
             """)
-
             cur.execute("""
                 CREATE OR REPLACE VIEW aktywne_regiony AS
                 SELECT * FROM regiony WHERE is_deleted = FALSE;
@@ -735,7 +704,6 @@ def init_db():
                 CREATE OR REPLACE VIEW aktywne_kola AS
                 SELECT * FROM kola WHERE is_deleted = FALSE;
             """)
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS czlonkowie (
                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -747,11 +715,10 @@ def init_db():
                     reczny_parametr TEXT DEFAULT 'AUTO'
                 );
             """)
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS wplaty (
                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    kolo_id BIGINT REFERENCES kola(id) ON DELETE RESTRICT,
+                    kolo_id BIGINT NOT NULL REFERENCES kola(id) ON DELETE RESTRICT,
                     czlonek_id BIGINT REFERENCES czlonkowie(id) ON DELETE SET NULL,
                     kwota_gr BIGINT NOT NULL,
                     data_wplaty DATE NOT NULL,
@@ -760,10 +727,6 @@ def init_db():
                     idempotency_key TEXT UNIQUE
                 );
             """)
-            cur.execute("ALTER TABLE wplaty ADD COLUMN IF NOT EXISTS kolo_id BIGINT REFERENCES kola(id) ON DELETE RESTRICT;")
-            cur.execute("ALTER TABLE wplaty ALTER COLUMN czlonek_id DROP NOT NULL;")
-
-            # BUFOR WPŁAT OCZEKUJĄCYCH
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS wplaty_oczekujace (
                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -781,28 +744,7 @@ def init_db():
                     powod_odrzucenia TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_wplaty_oczekujace_status ON wplaty_oczekujace(status);
-                CREATE INDEX IF NOT EXISTS idx_wplaty_oczekujace_kolo ON wplaty_oczekujace(kolo_id);
             """)
-
-            cur.execute("""
-                DO $$
-                BEGIN
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.columns 
-                        WHERE table_name = 'wplaty' AND column_name = 'kolo_id' AND is_nullable = 'YES'
-                    ) THEN
-                        UPDATE wplaty w 
-                        SET kolo_id = c.kolo_id 
-                        FROM czlonkowie c 
-                        WHERE w.czlonek_id = c.id AND w.kolo_id IS NULL;
-
-                        IF NOT EXISTS (SELECT 1 FROM wplaty WHERE kolo_id IS NULL) THEN
-                            ALTER TABLE wplaty ALTER COLUMN kolo_id SET NOT NULL;
-                        END IF;
-                    END IF;
-                END $$;
-            """)
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS naliczenia_reczne (
                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -839,80 +781,6 @@ def init_db():
                     powod TEXT,
                     data_wpisu TIMESTAMPTZ NOT NULL
                 );
-            """)
-
-            cur.execute("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_czlonkowie_nazwa') THEN
-                        ALTER TABLE czlonkowie ADD CONSTRAINT chk_czlonkowie_nazwa CHECK (length(trim(imie_nazwisko)) > 0);
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_czlonkowie_reczny_parametr') THEN
-                        ALTER TABLE czlonkowie ADD CONSTRAINT chk_czlonkowie_reczny_parametr CHECK (reczny_parametr IN ('AUTO', 'B', 'M', 'S'));
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_czlonkowie_daty') THEN
-                        ALTER TABLE czlonkowie ADD CONSTRAINT chk_czlonkowie_daty CHECK (data_przystapienia >= data_urodzenia AND data_urodzenia >= '1920-01-01');
-                    END IF;
-
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_wplaty_kwota') THEN
-                        ALTER TABLE wplaty ADD CONSTRAINT chk_wplaty_kwota CHECK (kwota_gr > 0);
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_wplaty_data') THEN
-                        ALTER TABLE wplaty ADD CONSTRAINT chk_wplaty_data CHECK (data_wplaty >= '2015-01-01');
-                    END IF;
-
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_naliczenia_kwota') THEN
-                        ALTER TABLE naliczenia_reczne ADD CONSTRAINT chk_naliczenia_kwota CHECK (kwota_gr > 0);
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_naliczenia_data') THEN
-                        ALTER TABLE naliczenia_reczne ADD CONSTRAINT chk_naliczenia_data CHECK (data_naliczenia >= '2015-01-01');
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_naliczenia_tytul') THEN
-                        ALTER TABLE naliczenia_reczne ADD CONSTRAINT chk_naliczenia_tytul CHECK (length(trim(tytul)) > 0);
-                    END IF;
-
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_wydatki_kwota') THEN
-                        ALTER TABLE wydatki ADD CONSTRAINT chk_wydatki_kwota CHECK (kwota_gr > 0);
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_wydatki_data') THEN
-                        ALTER TABLE wydatki ADD CONSTRAINT chk_wydatki_data CHECK (data_wydatku >= '2015-01-01');
-                    END IF;
-
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_korekty_data') THEN
-                        ALTER TABLE korekty ADD CONSTRAINT chk_korekty_data CHECK (data_korekty >= '2015-01-01');
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_korekty_kasy_data') THEN
-                        ALTER TABLE korekty_kasy ADD CONSTRAINT chk_korekty_kasy_data CHECK (data_korekty >= '2015-01-01');
-                    END IF;
-
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_kola_nazwa') THEN
-                        ALTER TABLE kola ADD CONSTRAINT chk_kola_nazwa CHECK (length(trim(nazwa)) > 0);
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_regiony_nazwa') THEN
-                        ALTER TABLE regiony ADD CONSTRAINT chk_regiony_nazwa CHECK (length(trim(nazwa)) > 0);
-                    END IF;
-                END $$;
-            """)
-
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_czlonkowie_kolo_id ON czlonkowie(kolo_id);
-                CREATE INDEX IF NOT EXISTS idx_wplaty_kolo_id ON wplaty(kolo_id);
-                CREATE INDEX IF NOT EXISTS idx_wplaty_czlonek_id ON wplaty(czlonek_id);
-                CREATE INDEX IF NOT EXISTS idx_wplaty_data_wplaty ON wplaty(data_wplaty);
-                CREATE INDEX IF NOT EXISTS idx_wplaty_kolo_data ON wplaty(kolo_id, data_wplaty);
-                CREATE INDEX IF NOT EXISTS idx_wplaty_czlonek_data ON wplaty(czlonek_id, data_wplaty);
-
-                CREATE INDEX IF NOT EXISTS idx_naliczenia_czlonek_data ON naliczenia_reczne(czlonek_id, data_naliczenia);
-                CREATE INDEX IF NOT EXISTS idx_korekty_czlonek_data ON korekty(czlonek_id, data_korekty);
-                CREATE INDEX IF NOT EXISTS idx_wydatki_kolo_data ON wydatki(kolo_id, data_wydatku);
-                CREATE INDEX IF NOT EXISTS idx_korekty_kasy_kolo_data ON korekty_kasy(kolo_id, data_korekty);
-
-                CREATE INDEX IF NOT EXISTS idx_kola_region_id ON kola(region_id);
-                CREATE INDEX IF NOT EXISTS idx_kola_kraj_id ON kola(kraj_id);
-                CREATE INDEX IF NOT EXISTS idx_regiony_kraj_id ON regiony(kraj_id);
-            """)
-
-            cur.execute("""
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                     tabela VARCHAR(50) NOT NULL,
@@ -923,65 +791,42 @@ def init_db():
                     zmieniono_o TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_audit_log_tabela_czas ON audit_log(tabela, zmieniono_o DESC);
-
-                CREATE OR REPLACE FUNCTION audit_trigger_func() RETURNS TRIGGER AS $$
-                BEGIN
-                    IF (TG_OP = 'INSERT') THEN
-                        INSERT INTO audit_log (tabela, operacja, rekord_id, stare_dane, nowe_dane, zmieniono_o)
-                        VALUES (TG_TABLE_NAME, 'INSERT', NEW.id, NULL, to_jsonb(NEW), CURRENT_TIMESTAMP);
-                        RETURN NEW;
-                    ELSIF (TG_OP = 'UPDATE') THEN
-                        IF to_jsonb(OLD) IS DISTINCT FROM to_jsonb(NEW) THEN
-                            INSERT INTO audit_log (tabela, operacja, rekord_id, stare_dane, nowe_dane, zmieniono_o)
-                            VALUES (TG_TABLE_NAME, 'UPDATE', NEW.id, to_jsonb(OLD), to_jsonb(NEW), CURRENT_TIMESTAMP);
-                        END IF;
-                        RETURN NEW;
-                    ELSIF (TG_OP = 'DELETE') THEN
-                        INSERT INTO audit_log (tabela, operacja, rekord_id, stare_dane, nowe_dane, zmieniono_o)
-                        VALUES (TG_TABLE_NAME, 'DELETE', OLD.id, to_jsonb(OLD), NULL, CURRENT_TIMESTAMP);
-                        RETURN OLD;
-                    END IF;
-                    RETURN NULL;
-                END;
-                $$ LANGUAGE plpgsql;
-
-                DO $do$
-                DECLARE
-                    t text;
-                BEGIN
-                    FOREACH t IN ARRAY ARRAY['czlonkowie', 'wplaty', 'naliczenia_reczne', 'korekty', 'wydatki', 'korekty_kasy', 'kola', 'regiony', 'uzytkownicy']
-                    LOOP
-                        EXECUTE format('DROP TRIGGER IF EXISTS trg_audit_%I ON %I;', t, t);
-                        EXECUTE format('CREATE TRIGGER trg_audit_%I AFTER INSERT OR UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION audit_trigger_func();', t, t);
-                    END LOOP;
-                END;
-                $do$;
             """)
-
-            # TWORZY DOMYŚLNEGO ADMINA TYLKO GDY BRAK JAKIEGOKOLWIEK ADMINA W BAZIE
             cur.execute("SELECT COUNT(*) FROM uzytkownicy WHERE rola = 'ADMIN';")
-            cnt_admin = cur.fetchone()[0]
-            if cnt_admin == 0:
+            if cur.fetchone()[0] == 0:
                 s_salt = generuj_sol()
                 s_pass_hash = hashuj_haslo("Centauri2026!", s_salt)
                 cur.execute("""
                     INSERT INTO uzytkownicy (login, haslo_hash, salt, imie_nazwisko, rola, is_active, wymus_zmiane_hasla)
                     VALUES ('admin', %s, %s, 'Super Administrator', 'ADMIN', TRUE, TRUE);
                 """, (s_pass_hash, s_salt))
-
         conn.commit()
+    return True
 
-init_db()
+init_db_once()
 
-# --- RETENCJA AUDYTU (RAZ NA DOBĘ) ---
-@st.cache_resource(ttl=86400)
-def retencja_audytu_raz_na_dobe():
-    try:
-        db_execute("DELETE FROM audit_log WHERE zmieniono_o < CURRENT_TIMESTAMP - INTERVAL '12 months';")
-    except Exception:
-        pass
+# --- OPTYMALIZACJA ZAPYTAŃ STRUKTURALNYCH (CACHE 60s) ---
+@st.cache_data(ttl=60, show_spinner=False)
+def pobierz_slownik_krajow():
+    return db_query("SELECT id, nazwa FROM kraje ORDER BY id ASC")
 
-retencja_audytu_raz_na_dobe()
+@st.cache_data(ttl=60, show_spinner=False)
+def pobierz_slownik_regionow(kraj_id):
+    return db_query("SELECT id, nazwa FROM aktywne_regiony WHERE kraj_id = %s ORDER BY nazwa ASC", (kraj_id,))
+
+@st.cache_data(ttl=60, show_spinner=False)
+def pobierz_liczbe_kol_bez_regionu(kraj_id):
+    return db_scalar("SELECT COUNT(*) FROM aktywne_kola WHERE region_id IS NULL AND kraj_id = %s", (kraj_id,)) or 0
+
+@st.cache_data(ttl=60, show_spinner=False)
+def pobierz_aktywne_kola_kraju(kraj_id):
+    return db_query("""
+        SELECT k.id, k.nazwa, k.region_id, r.nazwa as region_nazwa
+        FROM aktywne_kola k
+        LEFT JOIN aktywne_regiony r ON k.region_id = r.id
+        WHERE k.kraj_id = %s
+        ORDER BY k.nazwa ASC
+    """, (kraj_id,))
 
 # =========================================================================
 # MODUŁ AUTORYZACJI I BRAMKA LOGOWANIA
@@ -1022,7 +867,7 @@ if st.session_state["auth_user"] is None:
     formularz_logowania()
     st.stop()
 
-# WERYFIKACJA STANU KONTA W CZASIE RZECZYWISTYM
+# WERYFIKACJA STANU KONTA (SZYBKIE LEKKIE ZAPYTANIE PO PK)
 curr_user_id = st.session_state["auth_user"]["id"]
 weryfikacja_df = db_query("SELECT id, login, imie_nazwisko, rola, kraj_id, region_id, kolo_id, is_active, wymus_zmiane_hasla FROM uzytkownicy WHERE id = %s", (curr_user_id,))
 if weryfikacja_df.empty or not weryfikacja_df.iloc[0]["is_active"]:
@@ -1033,7 +878,7 @@ if weryfikacja_df.empty or not weryfikacja_df.iloc[0]["is_active"]:
 zalogowany_uzytkownik = weryfikacja_df.iloc[0].to_dict()
 st.session_state["auth_user"] = zalogowany_uzytkownik
 
-# WYMUSZENIE ZMIANY HASŁA (JEŚLI OFLAGOWANE)
+# WYMUSZENIE ZMIANY HASŁA
 if zalogowany_uzytkownik["wymus_zmiane_hasla"]:
     st.markdown("<br><br>", unsafe_allow_html=True)
     _, col_zm, _ = st.columns([1, 1.2, 1])
@@ -1291,12 +1136,9 @@ def filtruj_interwal(records, interwal_kod):
     return unikalne
 
 # =========================================================================
-# GŁÓWNA NAWIGACJA HIERARCHICZNA Z UWZGLĘDNIENIEM RÓL RBAC
+# GŁÓWNA NAWIGACJA HIERARCHICZNA
 # =========================================================================
-kraje_df = db_query("SELECT id, nazwa FROM kraje ORDER BY id ASC")
-if kraje_df.empty:
-    db_execute("INSERT INTO kraje (nazwa) VALUES ('Polska')")
-    kraje_df = db_query("SELECT id, nazwa FROM kraje ORDER BY id ASC")
+kraje_df = pobierz_slownik_krajow()
 mapa_krajow = dict(zip(kraje_df["id"], kraje_df["nazwa"]))
 
 rola_uzytkownika = zalogowany_uzytkownik["rola"]
@@ -1313,14 +1155,10 @@ with col_h2:
         wybrany_kraj_id = zalogowany_uzytkownik["kraj_id"] or list(mapa_krajow.keys())[0]
         st.selectbox("Kraj", options=[wybrany_kraj_id], format_func=lambda x: mapa_krajow.get(x, "Polska"), disabled=True)
 
-# 2. SCOPING REGIONU (BEZPIECZNIE ZDEFINIOWANY PRZED BLOKAMI WARUNKOWYMI)
-regiony_df = db_query("SELECT id, nazwa FROM aktywne_regiony WHERE kraj_id = %s ORDER BY nazwa ASC", (wybrany_kraj_id,))
+# 2. SCOPING REGIONU
+regiony_df = pobierz_slownik_regionow(wybrany_kraj_id)
 mapa_regionow = dict(zip(regiony_df["id"], regiony_df["nazwa"])) if not regiony_df.empty else {}
-
-liczba_kol_bez_regionu = db_scalar("""
-    SELECT COUNT(*) FROM aktywne_kola 
-    WHERE region_id IS NULL AND kraj_id = %s
-""", (wybrany_kraj_id,)) or 0
+liczba_kol_bez_regionu = pobierz_liczbe_kol_bez_regionu(wybrany_kraj_id)
 
 opcje_regionow = list(mapa_regionow.keys())
 if liczba_kol_bez_regionu > 0 and rola_uzytkownika in ("ADMIN", "SKARBNIK_KRAJOWY"):
@@ -1389,13 +1227,7 @@ if tryb_widoku == "🇵🇱 Statystyki Kraju":
     st.markdown(f"## 🇵🇱 Statystyki Ogólnokrajowe: {nazwa_kraju}")
     st.caption("Zagregowany bilans wszystkich aktywnych regionów i kół podległych jednostce centralnej | Czas biznesowy: **Warszawa**")
 
-    wszystkie_aktywne_kola_kraju = db_query("""
-        SELECT k.id, k.nazwa, k.region_id, r.nazwa as region_nazwa
-        FROM aktywne_kola k
-        LEFT JOIN aktywne_regiony r ON k.region_id = r.id
-        WHERE k.kraj_id = %s
-        ORDER BY k.nazwa ASC
-    """, (wybrany_kraj_id,))
+    wszystkie_aktywne_kola_kraju = pobierz_aktywne_kola_kraju(wybrany_kraj_id)
 
     kola_bez_regionu = wszystkie_aktywne_kola_kraju[wszystkie_aktywne_kola_kraju["region_id"].isna()]
     if not kola_bez_regionu.empty:
@@ -1755,7 +1587,7 @@ else:
             </div>
         """, unsafe_allow_html=True)
 
-    # --- DYNAMICZNY ZESTAW ZAKŁADEK W ZALEŻNOŚCI OD UPRAWNIEŃ ---
+    # --- DYNAMICZNY ZESTAW ZAKŁADEK ---
     zakladki_nazwy = ["📊 Tabela Zbiorcza", "📈 Profile & Wykresy", "💰 Wpłaty Członków"]
 
     if rola_uzytkownika in ("ADMIN", "SKARBNIK_KRAJOWY"):
@@ -1976,7 +1808,7 @@ else:
         else:
             opcje_w = {d["id"]: f"{d['imie_nazwisko']} (Saldo: {d['saldo_akt_pln']:.2f} zł)" for d in dane_przeliczone}
             
-            # ADMIN / SKARBNIK KRAJOWY (PEŁNY CRUD)
+            # ADMIN / SKARBNIK KRAJOWY
             if rola_uzytkownika in ("ADMIN", "SKARBNIK_KRAJOWY"):
                 tryb_operacji = st.radio("Wybierz czynność:", ["➕ Nowa wpłata (Księgowanie bezpośrednie)", "✏️ Popraw / Usuń wpłatę"], horizontal=True)
                 if tryb_operacji == "➕ Nowa wpłata (Księgowanie bezpośrednie)":
@@ -2056,7 +1888,7 @@ else:
                                     st.success("Wpłata zaktualizowana.")
                                 st.rerun()
 
-            # SKARBNIK KOŁA / REGIONU (DEKLARACJA Z OŚWIADCZENIEM)
+            # SKARBNIK KOŁA / REGIONU
             else:
                 st.markdown("#### 📥 Zadeklaruj Wpłatę Członka")
                 st.info("ℹ️ Jako Skarbnik Koła/Regionu deklarujesz wpłatę. Zostanie zaksięgowana w kasie po zatwierdzeniu przez Skarbnika Krajowego lub Administratora.")
@@ -3041,7 +2873,7 @@ else:
                             podglad = "\n".join([f_preview.readline() for _ in range(40)])
                         st.code(podglad, language="sql")
 
-    # 12. PANEL CENTAURI (TYLKO ADMIN)
+    # 12. PANEL CENTAURI (TYLKO DLA ADMINA)
     if "🏛️ Panel Centauri" in tab_map:
         with tab_map["🏛️ Panel Centauri"]:
             st.markdown("### 🏛️ Panel Centauri — Zarządzanie Kontami i Uprawnieniami")
@@ -3090,7 +2922,7 @@ else:
                         assigned_kolo = st.selectbox("Przypisz Skarbnika do Koła:", options=list(mapa_opcji_kol.keys()), format_func=lambda x: mapa_opcji_kol[x])
 
                 elif wybrana_rola == "SKARBNIK_REGIONU":
-                    wszystkie_aktywne_reg = db_query("SELECT id, nazwa, kraj_id FROM aktywne_regiony ORDER BY nazwa ASC")
+                    wszystkie_aktywne_reg = pobierz_slownik_regionow(wybrany_kraj_id)
                     if wszystkie_aktywne_reg.empty:
                         st.error("Brak aktywnych regionów w bazie. Najpierw utwórz region w strukturze.")
                     else:
@@ -3231,7 +3063,7 @@ else:
                         mapa_all_kola = dict(zip(wszystkie_aktywne_kola["id"], wszystkie_aktywne_kola["nazwa"])) if not wszystkie_aktywne_kola.empty else {}
                         new_kolo_id = st.selectbox("Przypisz nowe koło:", options=list(mapa_all_kola.keys()), format_func=lambda x: mapa_all_kola[x], key="sel_new_kolo")
                     elif nowa_rola_edit == "SKARBNIK_REGIONU":
-                        wszystkie_aktywne_reg = db_query("SELECT id, nazwa FROM aktywne_regiony ORDER BY nazwa ASC")
+                        wszystkie_aktywne_reg = pobierz_slownik_regionow(wybrany_kraj_id)
                         mapa_all_reg = dict(zip(wszystkie_aktywne_reg["id"], wszystkie_aktywne_reg["nazwa"])) if not wszystkie_aktywne_reg.empty else {}
                         new_reg_id = st.selectbox("Przypisz nowy region:", options=list(mapa_all_reg.keys()), format_func=lambda x: mapa_all_reg[x], key="sel_new_reg")
                     else:
@@ -3258,6 +3090,7 @@ else:
                                 SET rola = %s, kolo_id = NULL, region_id = NULL 
                                 WHERE id = %s
                             """, (nowa_rola_edit, sel_przepnij))
+                        st.cache_data.clear()
                         st.success("Uprawnienia zostały zaktualizowane!")
                         st.rerun()
 
