@@ -3037,62 +3037,79 @@ else:
                     else:
                         st.caption("Brak innych użytkowników do zawieszenia.")
 
-                # AKCJA 2: PRZEPIĘCIE UPRAWNIEŃ LUB PRZYPISANIA
+               # AKCJA 2: PRZEPIĘCIE UPRAWNIEŃ LUB PRZYPISANIA
                 with col_akc2:
                     st.markdown("#### 🔄 Przepnij Uprawnienia")
-                    opcje_przepiecia = {u["id"]: f"{u['login']} ({u['imie_nazwisko']})" for _, u in uzytkownicy_df.iterrows()}
-                    sel_przepnij = st.selectbox("Wybierz konto do modyfikacji:", options=list(opcje_przepiecia.keys()), format_func=lambda x: opcje_przepiecia[x], key="sel_przepnij")
+                    # ZABEZPIECZENIE: Wykluczamy zalogowanego Admina z listy do edycji roli
+                    opcje_przepiecia = {
+                        u["id"]: f"{u['login']} ({u['imie_nazwisko']})" 
+                        for _, u in uzytkownicy_df.iterrows()
+                        if u["id"] != curr_user_id
+                    }
                     
-                    nowa_rola_edit = st.selectbox(
-                        "Nowa rola:", 
-                        ["SKARBNIK_KOLA", "SKARBNIK_REGIONU", "SKARBNIK_KRAJOWY", "ADMIN"],
-                        format_func=lambda x: {
-                            "SKARBNIK_KOLA": "🏢 Skarbnik Koła",
-                            "SKARBNIK_REGIONU": "📊 Skarbnik Regionu",
-                            "SKARBNIK_KRAJOWY": "🇵🇱 Skarbnik Krajowy",
-                            "ADMIN": "👑 Administrator"
-                        }[x],
-                        key="sel_nowa_rola_edit"
-                    )
-
-                    new_kolo_id = None
-                    new_reg_id = None
-
-                    if nowa_rola_edit == "SKARBNIK_KOLA":
-                        wszystkie_aktywne_kola = db_query("SELECT id, nazwa FROM aktywne_kola ORDER BY nazwa ASC")
-                        mapa_all_kola = dict(zip(wszystkie_aktywne_kola["id"], wszystkie_aktywne_kola["nazwa"])) if not wszystkie_aktywne_kola.empty else {}
-                        new_kolo_id = st.selectbox("Przypisz nowe koło:", options=list(mapa_all_kola.keys()), format_func=lambda x: mapa_all_kola[x], key="sel_new_kolo")
-                    elif nowa_rola_edit == "SKARBNIK_REGIONU":
-                        wszystkie_aktywne_reg = pobierz_slownik_regionow(wybrany_kraj_id)
-                        mapa_all_reg = dict(zip(wszystkie_aktywne_reg["id"], wszystkie_aktywne_reg["nazwa"])) if not wszystkie_aktywne_reg.empty else {}
-                        new_reg_id = st.selectbox("Przypisz nowy region:", options=list(mapa_all_reg.keys()), format_func=lambda x: mapa_all_reg[x], key="sel_new_reg")
+                    if not opcje_przepiecia:
+                        st.caption("Brak innych użytkowników do zmiany uprawnień.")
                     else:
-                        st.caption("ℹ️ Ta rola ma dostęp ogólnokrajowy (brak przypisania do jednostki).")
+                        sel_przepnij = st.selectbox("Wybierz konto do modyfikacji:", options=list(opcje_przepiecia.keys()), format_func=lambda x: opcje_przepiecia[x], key="sel_przepnij")
+                        
+                        nowa_rola_edit = st.selectbox(
+                            "Nowa rola:", 
+                            ["SKARBNIK_KOLA", "SKARBNIK_REGIONU", "SKARBNIK_KRAJOWY", "ADMIN"],
+                            format_func=lambda x: {
+                                "SKARBNIK_KOLA": "🏢 Skarbnik Koła",
+                                "SKARBNIK_REGIONU": "📊 Skarbnik Regionu",
+                                "SKARBNIK_KRAJOWY": "🇵🇱 Skarbnik Krajowy",
+                                "ADMIN": "👑 Administrator"
+                            }[x],
+                            key="sel_nowa_rola_edit"
+                        )
 
-                    if st.button("Zastosuj przepięcie", key="btn_apply_reassign"):
+                        new_kolo_id = None
+                        new_reg_id = None
+
                         if nowa_rola_edit == "SKARBNIK_KOLA":
-                            k_info = db_query("SELECT region_id, kraj_id FROM kola WHERE id = %s", (new_kolo_id,)).iloc[0]
-                            db_execute("""
-                                UPDATE uzytkownicy 
-                                SET rola = %s, kolo_id = %s, region_id = %s, kraj_id = %s 
-                                WHERE id = %s
-                            """, (nowa_rola_edit, new_kolo_id, k_info["region_id"], k_info["kraj_id"], sel_przepnij))
+                            wszystkie_aktywne_kola = db_query("SELECT id, nazwa FROM aktywne_kola ORDER BY nazwa ASC")
+                            mapa_all_kola = dict(zip(wszystkie_aktywne_kola["id"], wszystkie_aktywne_kola["nazwa"])) if not wszystkie_aktywne_kola.empty else {}
+                            new_kolo_id = st.selectbox("Przypisz nowe koło:", options=list(mapa_all_kola.keys()), format_func=lambda x: mapa_all_kola[x], key="sel_new_kolo")
                         elif nowa_rola_edit == "SKARBNIK_REGIONU":
-                            r_info = db_query("SELECT kraj_id FROM regiony WHERE id = %s", (new_reg_id,)).iloc[0]
-                            db_execute("""
-                                UPDATE uzytkownicy 
-                                SET rola = %s, kolo_id = NULL, region_id = %s, kraj_id = %s 
-                                WHERE id = %s
-                            """, (nowa_rola_edit, new_reg_id, r_info["kraj_id"], sel_przepnij))
+                            wszystkie_aktywne_reg = pobierz_slownik_regionow(wybrany_kraj_id)
+                            mapa_all_reg = dict(zip(wszystkie_aktywne_reg["id"], wszystkie_aktywne_reg["nazwa"])) if not wszystkie_aktywne_reg.empty else {}
+                            new_reg_id = st.selectbox("Przypisz nowy region:", options=list(mapa_all_reg.keys()), format_func=lambda x: mapa_all_reg[x], key="sel_new_reg")
                         else:
-                            db_execute("""
-                                UPDATE uzytkownicy 
-                                SET rola = %s, kolo_id = NULL, region_id = NULL 
-                                WHERE id = %s
-                            """, (nowa_rola_edit, sel_przepnij))
-                        st.cache_data.clear()
-                        st.success("Uprawnienia zostały zaktualizowane!")
-                        st.rerun()
+                            st.caption("ℹ️ Ta rola ma dostęp ogólnokrajowy (brak przypisania do jednostki).")
+
+                        if st.button("Zastosuj przepięcie", key="btn_apply_reassign"):
+                            if sel_przepnij == curr_user_id:
+                                st.error("❌ Blokada bezpieczeństwa: Nie możesz zmodyfikować uprawnień własnego profilu!")
+                            elif nowa_rola_edit == "SKARBNIK_KOLA":
+                                k_info = db_query("SELECT region_id, kraj_id FROM kola WHERE id = %s", (new_kolo_id,)).iloc[0]
+                                db_execute("""
+                                    UPDATE uzytkownicy 
+                                    SET rola = %s, kolo_id = %s, region_id = %s, kraj_id = %s 
+                                    WHERE id = %s
+                                """, (nowa_rola_edit, new_kolo_id, k_info["region_id"], k_info["kraj_id"], sel_przepnij))
+                                st.cache_data.clear()
+                                st.success("Uprawnienia zostały zaktualizowane!")
+                                st.rerun()
+                            elif nowa_rola_edit == "SKARBNIK_REGIONU":
+                                r_info = db_query("SELECT kraj_id FROM regiony WHERE id = %s", (new_reg_id,)).iloc[0]
+                                db_execute("""
+                                    UPDATE uzytkownicy 
+                                    SET rola = %s, kolo_id = NULL, region_id = %s, kraj_id = %s 
+                                    WHERE id = %s
+                                """, (nowa_rola_edit, new_reg_id, r_info["kraj_id"], sel_przepnij))
+                                st.cache_data.clear()
+                                st.success("Uprawnienia zostały zaktualizowane!")
+                                st.rerun()
+                            else:
+                                db_execute("""
+                                    UPDATE uzytkownicy 
+                                    SET rola = %s, kolo_id = NULL, region_id = NULL 
+                                    WHERE id = %s
+                                """, (nowa_rola_edit, sel_przepnij))
+                                st.cache_data.clear()
+                                st.success("Uprawnienia zostały zaktualizowane!")
+                                st.rerun()
 
                 # AKCJA 3: RESET HASŁA
                 with col_akc3:
