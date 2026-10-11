@@ -2,9 +2,6 @@ import os
 import calendar
 import uuid
 import json
-import shutil
-import subprocess
-import re
 import hashlib
 import secrets
 from urllib.parse import urlparse
@@ -104,47 +101,12 @@ def get_db_conninfo():
         return os.environ["DATABASE_URL"]
     return None
 
-def parse_conninfo_for_pg_dump(conninfo: str):
-    if not conninfo:
-        return {}, "localhost", "5432", "postgres", "citadel_db"
-    
-    if conninfo.startswith("postgresql://") or conninfo.startswith("postgres://"):
-        parsed = urlparse(conninfo)
-        host = parsed.hostname or "localhost"
-        port = str(parsed.port or 5432)
-        raw_db = parsed.path.lstrip("/")
-        dbname = raw_db.split("?")[0] if "?" in raw_db else (raw_db or "citadel_db")
-        user = parsed.username or "postgres"
-        password = parsed.password or ""
-    else:
-        pattern = re.compile(r'(\w+)\s*=\s*(?:([^\s\'"]+)|(?:\'([^\']*)\')|(?:"([^"]*)"))')
-        params = {}
-        for match in pattern.finditer(conninfo):
-            key = match.group(1)
-            val = match.group(2) or match.group(3) or match.group(4) or ""
-            params[key] = val
-        host = params.get("host", "localhost")
-        port = str(params.get("port", "5432"))
-        dbname = params.get("dbname", "citadel_db")
-        user = params.get("user", "postgres")
-        password = params.get("password", "")
-
-    env_vars = {
-        "PGHOST": host,
-        "PGPORT": port,
-        "PGDATABASE": dbname,
-        "PGUSER": user,
-        "PGPASSWORD": password
-    }
-    return env_vars, host, port, user, dbname
-
 @st.cache_resource
 def get_db_pool():
     conninfo = get_db_conninfo()
     if not conninfo:
         st.error("⚠️ Brak konfiguracji bazy danych w secrets.toml lub zmiennej DATABASE_URL.")
         st.stop()
-        
     return ConnectionPool(conninfo=conninfo, min_size=1, max_size=5, open=True)
 
 pool = get_db_pool()
@@ -172,7 +134,7 @@ def db_scalar(sql: str, params=None):
             row = cur.fetchone()
             return row[0] if row else None
 
-# --- GENERATOR ZRZUTU BAZY DANYCH (STRUMIENIOWY NA DYSK, Z PEŁNYM RBAC) ---
+# --- GENERATOR ZRZUTU BAZY DANYCH (.sql) ---
 DDL_SCHEMA_EXPORT = """-- === DEFINICJE STRUKTURY DANYCH (DDL) ===
 CREATE TABLE IF NOT EXISTS kraje (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -327,7 +289,7 @@ def generuj_zrzut_bazy_sql():
         f_out.write("SET check_function_bodies = false;\n")
         f_out.write("SET client_min_messages = warning;\n")
         f_out.write("SET row_security = off;\n")
-        f_out.write("SET session_replication_role = replica; -- Wyłącza sprawdzanie FK i triggery na czas odtwarzania\n\n")
+        f_out.write("SET session_replication_role = replica;\n\n")
         f_out.write("BEGIN;\n\n")
         f_out.write(DDL_SCHEMA_EXPORT)
         f_out.write("\n-- === CZYSZCZENIE DANYCH PRZED IMPORTEM ===\n")
@@ -365,7 +327,7 @@ def generuj_zrzut_bazy_sql():
                         f_out.write(f'SELECT setval(pg_get_serial_sequence(\'"{tab}"\', \'id\'), COALESCE(max(id), 1)) FROM "{tab}";\n')
 
         f_out.write("\nCOMMIT;\n\n")
-        f_out.write("SET session_replication_role = DEFAULT; -- Przywraca normalne działanie triggerów i FK\n")
+        f_out.write("SET session_replication_role = DEFAULT;\n")
 
     file_size_kb = os.path.getsize(filepath) / 1024.0
     return filepath, filename, file_size_kb, "Citadel Python Engine (FK-safe + RBAC)"
@@ -637,7 +599,7 @@ DARK_THEME_CSS = """
 """
 st.markdown(DARK_THEME_CSS, unsafe_allow_html=True)
 
-# --- INICJALIZACJA STRUKTURY (ZOPTYMALIZOWANA: ODPALA SIĘ DOKŁADNIE RAZ DZIĘKI @st.cache_resource) ---
+# --- INICJALIZACJA STRUKTURY (TYLKO RAZ NA START SERWERA DZIĘKI @st.cache_resource) ---
 @st.cache_resource(show_spinner=False)
 def init_db_once():
     with pool.connection() as conn:
@@ -805,7 +767,7 @@ def init_db_once():
 
 init_db_once()
 
-# --- OPTYMALIZACJA ZAPYTAŃ STRUKTURALNYCH (CACHE 60s) ---
+# Słowniki metadanych z pamięcią podręczną
 @st.cache_data(ttl=60, show_spinner=False)
 def pobierz_slownik_krajow():
     return db_query("SELECT id, nazwa FROM kraje ORDER BY id ASC")
@@ -836,7 +798,7 @@ if "auth_user" not in st.session_state:
 
 def formularz_logowania():
     st.markdown("<br><br>", unsafe_allow_html=True)
-    c_l1, c_l2, c_l3 = st.columns([1, 1.2, 1])
+    _, c_l2, _ = st.columns([1, 1.2, 1])
     with c_l2:
         st.markdown("""
             <div class="bento-card" style="text-align: center; border: 1px solid #4338ca; box-shadow: 0 15px 35px -5px rgba(99, 102, 241, 0.25);">
@@ -867,25 +829,25 @@ if st.session_state["auth_user"] is None:
     formularz_logowania()
     st.stop()
 
-# WERYFIKACJA STANU KONTA (SZYBKIE LEKKIE ZAPYTANIE PO PK)
+# Ciągła weryfikacja statusu konta przy każdym przeładowaniu
 curr_user_id = st.session_state["auth_user"]["id"]
 weryfikacja_df = db_query("SELECT id, login, imie_nazwisko, rola, kraj_id, region_id, kolo_id, is_active, wymus_zmiane_hasla FROM uzytkownicy WHERE id = %s", (curr_user_id,))
 if weryfikacja_df.empty or not weryfikacja_df.iloc[0]["is_active"]:
     st.session_state["auth_user"] = None
-    st.warning("Sesja zakończona lub konto zostało zawieszone.")
+    st.warning("Sesja zakończona lub konto zostało zawieszone przez Administratora.")
     st.rerun()
 
 zalogowany_uzytkownik = weryfikacja_df.iloc[0].to_dict()
 st.session_state["auth_user"] = zalogowany_uzytkownik
 
-# WYMUSZENIE ZMIANY HASŁA
+# WYMUSZENIE ZMIANY HASŁA STARTOWEGO
 if zalogowany_uzytkownik["wymus_zmiane_hasla"]:
     st.markdown("<br><br>", unsafe_allow_html=True)
     _, col_zm, _ = st.columns([1, 1.2, 1])
     with col_zm:
-        st.warning("⚠️ Twoje konto wymaga zmiany hasła przed uzyskaniem dostępu.")
+        st.warning("⚠️ Twoje konto wymaga zmiany hasła przed uzyskaniem dostępu do panelu.")
         with st.form("form_wymus_haslo"):
-            n_haslo1 = st.text_input("Nowe hasło", type="password")
+            n_haslo1 = st.text_input("Nowe hasło (min. 8 znaków)", type="password")
             n_haslo2 = st.text_input("Powtórz nowe hasło", type="password")
             if st.form_submit_button("Zapisz nowe hasło i wejdź do Citadel"):
                 if len(n_haslo1) < 8:
@@ -900,11 +862,14 @@ if zalogowany_uzytkownik["wymus_zmiane_hasla"]:
                         SET haslo_hash = %s, salt = %s, wymus_zmiane_hasla = FALSE 
                         WHERE id = %s
                     """, (n_hash, n_salt, curr_user_id))
+                    st.session_state["auth_user"]["wymus_zmiane_hasla"] = False
+                    st.session_state["auth_user"]["haslo_hash"] = n_hash
+                    st.session_state["auth_user"]["salt"] = n_salt
                     st.success("Hasło zostało zaktualizowane!")
                     st.rerun()
     st.stop()
 
-# --- REGUŁY BIZNESOWE FINANSÓW ---
+# --- REGUŁY BIZNESOWE FINANSÓW I KDI ---
 def pobierz_parametr(data_urodzenia_val, reczny_parametr, punkt_odniesienia):
     if reczny_parametr in ["B", "M", "S"]:
         stawki_gr = {"B": 600, "M": 900, "S": 1500}
@@ -940,7 +905,7 @@ def oblicz_naliczenia_gr(data_wstapienia_val, data_urodzenia_val, reczny_paramet
 
     return suma_gr, licznik
 
-# --- PRZELICZANIE FINANSÓW Z PAMIĘCIĄ PODRĘCZNĄ ---
+# PRZELICZANIE FINANSÓW Z PAMIĘCIĄ PODRĘCZNĄ
 @st.cache_data(ttl=60, show_spinner=False)
 def _przelicz_finanse_wielu_kol_cached(kolo_ids_tuple, punkt_odniesienia):
     if not kolo_ids_tuple:
@@ -1140,7 +1105,6 @@ def filtruj_interwal(records, interwal_kod):
 # =========================================================================
 kraje_df = pobierz_slownik_krajow()
 mapa_krajow = dict(zip(kraje_df["id"], kraje_df["nazwa"]))
-
 rola_uzytkownika = zalogowany_uzytkownik["rola"]
 
 col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns([1.8, 0.8, 1.2, 1.4, 0.9])
@@ -1212,6 +1176,12 @@ with col_h5:
     if st.button("Wyloguj", key="btn_logout", use_container_width=True):
         st.session_state["auth_user"] = None
         st.rerun()
+
+# --- GLOBALNY BANNER POWIADOMIENIA O OCZEKUJĄCYCH WPŁATACH ---
+if rola_uzytkownika in ("ADMIN", "SKARBNIK_KRAJOWY"):
+    liczba_oczekujacych_global = db_scalar("SELECT COUNT(*) FROM wplaty_oczekujace WHERE status = 'OCZEKUJE';") or 0
+    if liczba_oczekujacych_global > 0:
+        st.warning(f"🔔 **Kolejka Weryfikacji:** Wpłaty czekające na Twoją akceptację: **{liczba_oczekujacych_global}**. Przejdź do widoku **🏢 Koło $\\rightarrow$ 📥 Wpłaty do zaakceptowania**, aby je zatwierdzić.")
 
 nazwa_kraju = mapa_krajow.get(wybrany_kraj_id, "Polska")
 dzis = dzis_pl()
@@ -1808,10 +1778,15 @@ else:
         else:
             opcje_w = {d["id"]: f"{d['imie_nazwisko']} (Saldo: {d['saldo_akt_pln']:.2f} zł)" for d in dane_przeliczone}
             
-            # ADMIN / SKARBNIK KRAJOWY
+            # WIDOK WPŁAT: ADMIN / SKARBNIK KRAJOWY
             if rola_uzytkownika in ("ADMIN", "SKARBNIK_KRAJOWY"):
-                tryb_operacji = st.radio("Wybierz czynność:", ["➕ Nowa wpłata (Księgowanie bezpośrednie)", "✏️ Popraw / Usuń wpłatę"], horizontal=True)
-                if tryb_operacji == "➕ Nowa wpłata (Księgowanie bezpośrednie)":
+                tryb_operacji = st.radio(
+                    "Wybierz czynność:", 
+                    ["➕ Nowa wpłata (Księgowanie bezpośrednie)", "📥 Zgłoś do kolejki akceptacji (Test procedury)", "✏️ Popraw / Usuń wpłatę"], 
+                    horizontal=True
+                )
+
+                if tryb_operacji in ("➕ Nowa wpłata (Księgowanie bezpośrednie)", "📥 Zgłoś do kolejki akceptacji (Test procedury)"):
                     if "wplata_token" not in st.session_state:
                         st.session_state["wplata_token"] = str(uuid.uuid4())
                     with st.form("form_wplata_nowa_admin", clear_on_submit=False):
@@ -1819,31 +1794,49 @@ else:
                         kwota_pln = st.number_input("Kwota wpłaty (PLN)", min_value=0.01, value=9.0, step=1.0)
                         data_w = st.date_input("Data wpływu środków", value=dzis_pl(), min_value=date(2015, 1, 1), max_value=dzis_pl())
                         notatka = st.text_input("Tytuł / Notatka", value="Składka członkowska")
+                        
+                        osw_test = "MAM_POTWIERDZENIE"
+                        if tryb_operacji == "📥 Zgłoś do kolejki akceptacji (Test procedury)":
+                            osw_test = st.selectbox("Oświadczenie testowe:", ["MAM_POTWIERDZENIE", "BRAK_POTWIERDZENIA"])
+
                         wymus_duplikat = st.checkbox("Potwierdzam celowe dodanie kolejnej identycznej wpłaty (w ciągu 60s)")
                         
-                        if st.form_submit_button("Zaksięguj nową wpłatę bezpośrednio"):
+                        btn_txt = "Zaksięguj nową wpłatę bezpośrednio" if "Księgowanie" in tryb_operacji else "Wyślij wpłatę do kolejki weryfikacji"
+                        if st.form_submit_button(btn_txt):
                             kwota_gr = int(round(kwota_pln * 100))
                             teraz = teraz_utc()
-                            granica_czasu = teraz - timedelta(seconds=60)
-                            liczba_ostatnich = db_scalar("""
-                                SELECT COUNT(*) FROM wplaty 
-                                WHERE czlonek_id = %s AND kwota_gr = %s AND data_wpisu >= %s
-                            """, (wybrany, kwota_gr, granica_czasu))
-                            
-                            if liczba_ostatnich and liczba_ostatnich > 0 and not wymus_duplikat:
-                                st.error("⚠️ Wykryto identyczną wpłatę w ciągu ostatnich 60 sekund. Zaznacz checkbox, aby potwierdzić.")
+                            czl_kolo_id = db_scalar("SELECT kolo_id FROM czlonkowie WHERE id = %s", (wybrany,)) or wybrane_kolo_id
+
+                            if tryb_operacji == "➕ Nowa wpłata (Księgowanie bezpośrednie)":
+                                granica_czasu = teraz - timedelta(seconds=60)
+                                liczba_ostatnich = db_scalar("""
+                                    SELECT COUNT(*) FROM wplaty 
+                                    WHERE czlonek_id = %s AND kwota_gr = %s AND data_wpisu >= %s
+                                """, (wybrany, kwota_gr, granica_czasu))
+                                
+                                if liczba_ostatnich and liczba_ostatnich > 0 and not wymus_duplikat:
+                                    st.error("⚠️ Wykryto identyczną wpłatę w ciągu ostatnich 60 sekund. Zaznacz checkbox, aby potwierdzić.")
+                                else:
+                                    try:
+                                        db_execute("""
+                                            INSERT INTO wplaty (kolo_id, czlonek_id, kwota_gr, data_wplaty, notatka, data_wpisu, idempotency_key)
+                                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                        """, (czl_kolo_id, wybrany, kwota_gr, data_w, notatka, teraz, st.session_state["wplata_token"]))
+                                        st.session_state["wplata_token"] = str(uuid.uuid4())
+                                        st.cache_data.clear()
+                                        st.success("Wpłata zarejestrowana bezpośrednio w księdze.")
+                                        st.rerun()
+                                    except (psycopg.IntegrityError, errors.UniqueViolation):
+                                        st.warning("Ta transakcja została już przetworzona w tle.")
                             else:
-                                try:
-                                    db_execute("""
-                                        INSERT INTO wplaty (kolo_id, czlonek_id, kwota_gr, data_wplaty, notatka, data_wpisu, idempotency_key)
-                                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                    """, (wybrane_kolo_id, wybrany, kwota_gr, data_w, notatka, teraz, st.session_state["wplata_token"]))
-                                    st.session_state["wplata_token"] = str(uuid.uuid4())
-                                    st.cache_data.clear()
-                                    st.success("Wpłata zarejestrowana bezpośrednio w księdze.")
-                                    st.rerun()
-                                except (psycopg.IntegrityError, errors.UniqueViolation):
-                                    st.warning("Ta transakcja została już przetworzona w tle.")
+                                db_execute("""
+                                    INSERT INTO wplaty_oczekujace (kolo_id, czlonek_id, zglosil_uzytkownik_id, kwota_gr, data_wplaty, notatka, oswiadczenie, status)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'OCZEKUJE')
+                                """, (czl_kolo_id, wybrany, curr_user_id, kwota_gr, data_w, notatka, osw_test))
+                                st.cache_data.clear()
+                                st.success("✅ Wpłata trafiła do kolejki weryfikacji! Możesz ją zatwierdzić w zakładce '📥 Wpłaty do zaakceptowania'.")
+                                st.rerun()
+
                 else:
                     wplaty_lista = db_query("""
                         SELECT w.id, w.czlonek_id, w.kwota_gr, w.data_wplaty, w.notatka, c.imie_nazwisko 
@@ -1888,7 +1881,7 @@ else:
                                     st.success("Wpłata zaktualizowana.")
                                 st.rerun()
 
-            # SKARBNIK KOŁA / REGIONU
+            # WIDOK WPŁAT: SKARBNIK KOŁA / REGIONU
             else:
                 st.markdown("#### 📥 Zadeklaruj Wpłatę Członka")
                 st.info("ℹ️ Jako Skarbnik Koła/Regionu deklarujesz wpłatę. Zostanie zaksięgowana w kasie po zatwierdzeniu przez Skarbnika Krajowego lub Administratora.")
@@ -1911,11 +1904,13 @@ else:
                     if st.form_submit_button("Wyślij wpłatę do zaakceptowania"):
                         kod_oswiadczenia = "MAM_POTWIERDZENIE" if "Dysponuję" in oswiadczenie_wybor else "BRAK_POTWIERDZENIA"
                         kwota_gr_deklarowana = int(round(deklarowana_kwota_pln * 100))
+                        czl_kolo_id = db_scalar("SELECT kolo_id FROM czlonkowie WHERE id = %s", (wybrany_czl,)) or wybrane_kolo_id
                         
                         db_execute("""
                             INSERT INTO wplaty_oczekujace (kolo_id, czlonek_id, zglosil_uzytkownik_id, kwota_gr, data_wplaty, notatka, oswiadczenie, status)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, 'OCZEKUJE')
-                        """, (wybrane_kolo_id, wybrany_czl, curr_user_id, kwota_gr_deklarowana, deklarowana_data, deklarowana_notatka, kod_oswiadczenia))
+                        """, (czl_kolo_id, wybrany_czl, curr_user_id, kwota_gr_deklarowana, deklarowana_data, deklarowana_notatka, kod_oswiadczenia))
+                        st.cache_data.clear()
                         st.success("✅ Wpłata została zgłoszona! Trafiła do kolejki akceptacji.")
                         st.rerun()
 
@@ -2769,7 +2764,7 @@ else:
             
             with subtab_audyt_db:
                 st.markdown("#### 🛡️ Rejestr Zmian Systemowych (PostgreSQL Audit Trigger)")
-                st.caption("Rejestruje każde zdarzenie INSERT, UPDATE oraz DELETE bezpośrednio na poziomie bazy. Wpisy starsze niż 12 miesięcy są automatycznie usuwane raz na dobę.")
+                st.caption("Rejestruje każde zdarzenie INSERT, UPDATE oraz DELETE bezpośrednio na poziomie bazy.")
                 
                 c_f1, c_f2 = st.columns(2)
                 with c_f1:
@@ -2868,12 +2863,7 @@ else:
                             key="btn_download_sql_file"
                         )
 
-                    with st.expander("🔍 Podgląd pierwszych 40 linii wygenerowanego pliku .sql"):
-                        with open(b_path, "r", encoding="utf-8") as f_preview:
-                            podglad = "\n".join([f_preview.readline() for _ in range(40)])
-                        st.code(podglad, language="sql")
-
-    # 12. PANEL CENTAURI (TYLKO DLA ADMINA)
+    # 12. PANEL CENTAURI (TYLKO DLA ADMINA — ZABEZPIECZONY PRZED SELF-LOCKOUTEM)
     if "🏛️ Panel Centauri" in tab_map:
         with tab_map["🏛️ Panel Centauri"]:
             st.markdown("### 🏛️ Panel Centauri — Zarządzanie Kontami i Uprawnieniami")
@@ -3018,7 +3008,7 @@ else:
                 st.markdown("---")
                 col_akc1, col_akc2, col_akc3 = st.columns(3)
 
-                # AKCJA 1: ZAWIESZENIE / ODBLOKOWANIE
+                # AKCJA 1: ZAWIESZENIE / ODBLOKOWANIE (WYKLUCZENIE SIEBIE)
                 with col_akc1:
                     st.markdown("#### ⏸️ Zawieś / Odblokuj Dostęp")
                     opcje_zawieszenia = {
@@ -3037,10 +3027,9 @@ else:
                     else:
                         st.caption("Brak innych użytkowników do zawieszenia.")
 
-               # AKCJA 2: PRZEPIĘCIE UPRAWNIEŃ LUB PRZYPISANIA
+                # AKCJA 2: PRZEPIĘCIE UPRAWNIEŃ (BEZWZGLĘDNA BLOKADA SAMOOKALECZENIA ADMINA)
                 with col_akc2:
                     st.markdown("#### 🔄 Przepnij Uprawnienia")
-                    # ZABEZPIECZENIE: Wykluczamy zalogowanego Admina z listy do edycji roli
                     opcje_przepiecia = {
                         u["id"]: f"{u['login']} ({u['imie_nazwisko']})" 
                         for _, u in uzytkownicy_df.iterrows()
@@ -3114,8 +3103,9 @@ else:
                 # AKCJA 3: RESET HASŁA
                 with col_akc3:
                     st.markdown("#### 🔑 Reset Hasła")
-                    sel_reset = st.selectbox("Konto do resetu:", options=list(opcje_przepiecia.keys()), format_func=lambda x: opcje_przepiecia[x], key="sel_reset")
-                    haslo_reset_val = st.text_input("Nowe tymczasowe hasło:", value="Citadel2026!", key="txt_reset_pass")
+                    opcje_resetu = {u["id"]: f"{u['login']} ({u['imie_nazwisko']})" for _, u in uzytkownicy_df.iterrows()}
+                    sel_reset = st.selectbox("Konto do resetu:", options=list(opcje_resetu.keys()), format_func=lambda x: opcje_resetu[x], key="sel_reset")
+                    haslo_reset_val = st.text_input("Nowe hasło:", value="Citadel2026!", key="txt_reset_pass")
                     wymus_reset_check = st.checkbox("Wymuś zmianę przy kolejnym logowaniu", value=True, key="chk_reset_wymus")
                     if st.button("Ustaw nowe hasło", key="btn_apply_reset_pass"):
                         if len(haslo_reset_val) < 6:
@@ -3128,4 +3118,4 @@ else:
                                 SET haslo_hash = %s, salt = %s, wymus_zmiane_hasla = %s 
                                 WHERE id = %s
                             """, (r_hash, r_sol, wymus_reset_check, sel_reset))
-                            st.success("Hasło zostało zresetowane!")
+                            st.success("Hasło zostało pomyślnie zresetowane!")
